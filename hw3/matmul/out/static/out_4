@@ -1,0 +1,22 @@
+Options:
+  Problem size: M = 4096, N = 4096, K = 4096
+  Number of threads: 4
+  Number of iterations: 10
+  Print matrix: off
+  Validation: on
+
+Initializing... done!
+Calculating...(iter=0) 1.530917 sec
+Calculating...(iter=1) 1.509360 sec
+Calculating...(iter=2) 1.500914 sec
+Calculating...(iter=3) 1.521795 sec
+Calculating...(iter=4) 1.508523 sec
+Calculating...(iter=5) 1.502811 sec
+Calculating...(iter=6) 1.575626 sec
+Calculating...(iter=7) 1.576069 sec
+Calculating...(iter=8) 1.503438 sec
+Calculating...(iter=9) 1.536588 sec
+Validating...
+Result: VALID
+Avg. time: 1.526604 sec
+Avg. throughput: 90.029206 GFLOPS

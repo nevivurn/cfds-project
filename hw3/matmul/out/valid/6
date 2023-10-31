@@ -1,0 +1,13 @@
+Options:
+  Problem size: M = 3347, N = 171, K = 688
+  Number of threads: 2
+  Number of iterations: 1
+  Print matrix: off
+  Validation: on
+
+Initializing... done!
+Calculating...(iter=0) 0.027150 sec
+Validating...
+Result: VALID
+Avg. time: 0.027150 sec
+Avg. throughput: 29.007347 GFLOPS
