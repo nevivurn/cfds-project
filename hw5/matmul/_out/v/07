@@ -1,0 +1,15 @@
+Options:
+  Problem size: M = 2962, N = 373, K = 1957
+  Number of iterations: 1
+  Print matrix: off
+  Validation: on
+
+Initializing... done!
+Initializing OpenCL...
+Detected OpenCL platform: NVIDIA CUDA
+Detected OpenCL device: NVIDIA TITAN RTX
+Calculating...(iter=0) 0.138604 sec
+Validating...
+Result: VALID
+Avg. time: 0.138604 sec
+Avg. throughput: 31.198778 GFLOPS
