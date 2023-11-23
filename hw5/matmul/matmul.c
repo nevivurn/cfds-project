@@ -22,7 +22,7 @@ static cl_kernel kernel;
 static cl_kernel kernel_slow;
 static cl_mem a_d, b_d, c_d;
 
-#define T 32
+#define T 128
 #define W 8
 
 void matmul(const float *A, const float *B, float *C, int M, int N, int K) {
@@ -36,7 +36,8 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K) {
   size_t gws[2];
   size_t lws[2];
 
-  if (M%T == 0 && N%T == 0 && K%T == 0) {
+  // Select appropriate kernel for matrix size
+  if (M%T == 0 && N%T == 0 && K%W == 0) {
 	  selected = kernel;
 	  gws[0] = M/W; gws[1] = N/W;
 	  lws[0] = T/W; lws[1] = T/W;
