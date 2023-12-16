@@ -5,6 +5,9 @@
 #include "classifier.h"
 #include "util.h"
 
+#define BATCH 512
+#define NGPU 4
+
 #define CHECK_CUDA(call)                                              \
   do {                                                                \
     cudaError_t status_ = call;                                       \
@@ -15,7 +18,8 @@
     }                                                                 \
   } while (0)
 
-static int mpi_rank;
+static int mpi_rank, mpi_world_size;
+static cudaStream_t streams[NGPU];
 
 // Multi-dimensional matrix containing fp32 elements
 struct Tensor {
@@ -25,12 +29,12 @@ struct Tensor {
   __host__ __device__ int num_elem() const;
   void fill_zeros();
 
-  void allocate_gpu();
-  void copy_to_gpu(cudaStream_t stream = 0);
-  void copy_to_cpu(cudaStream_t stream = 0);
+  void allocate_gpu(int gpu);
+  void copy_to_gpu(int gpu);
+  void copy_to_cpu(int gpu);
 
   float *buf = nullptr;
-  float *gbuf = nullptr;
+  float *gbuf[NGPU] = { nullptr };
   int ndim = 0;
   int shape[4];
   int datashape[4];
@@ -68,29 +72,28 @@ void Tensor::fill_zeros() {
   for (int n = 0; n < N_; ++n) { buf[n] = 0.0; }
 }
 
-void Tensor::allocate_gpu() {
-  CHECK_CUDA(cudaMalloc(&gbuf, num_elem() * sizeof(float)));
+void Tensor::allocate_gpu(int gpu) {
+  CHECK_CUDA(cudaMalloc(&gbuf[gpu], num_elem() * sizeof(float)));
 }
 
-void Tensor::copy_to_gpu(cudaStream_t stream) {
-  if (gbuf == nullptr)
-    allocate_gpu();
-  CHECK_CUDA(cudaMemcpyAsync(gbuf, buf, num_elem() * sizeof(float), cudaMemcpyHostToDevice, stream));
+void Tensor::copy_to_gpu(int gpu) {
+  if (gbuf[gpu] == nullptr)
+    allocate_gpu(gpu);
+  CHECK_CUDA(cudaMemcpyAsync(gbuf[gpu], buf, num_elem() * sizeof(float), cudaMemcpyHostToDevice, streams[gpu]));
 }
 
-void Tensor::copy_to_cpu(cudaStream_t stream) {
-  CHECK_CUDA(cudaMemcpyAsync(buf, gbuf, num_elem() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+void Tensor::copy_to_cpu(int gpu) {
+  CHECK_CUDA(cudaMemcpyAsync(buf, gbuf[gpu], num_elem() * sizeof(float), cudaMemcpyDeviceToHost, streams[gpu]));
 }
 
-void print_tensor(Tensor *t, int n) {
-  t->copy_to_cpu();
-  CHECK_CUDA(cudaStreamSynchronize(0));
+void print_tensor(Tensor *t, int gpu, int n = 4) {
+  t->copy_to_cpu(gpu);
+  CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
 
-  int n1 = t->shape[0];
-  printf("size: %d %d %d\n", t->shape[0], t->shape[1], t->shape[2]);
-  for (int i = 0; i < t->num_elem() / n1; ++i) {
-    printf("%.4f ", t->buf[n * t->num_elem() / n1 + i]);
+  for (int i = 0; i < n; ++i) {
+    printf("%.4f ", t->buf[i]);
   }
+  printf("\n");
 }
 
 // Parameters
@@ -100,13 +103,13 @@ Tensor *w_conv1, *w_conv2, *w_conv3, *w_conv4, *w_conv5, *w_conv6, *b_conv1,
 
 // Activations
 Tensor *a_conv1, *a_layernorm1, *a_relu1, *a_pool1;
-Tensor *a_conv1_sum, *a_conv1_sum_sq; // for layernorm
+Tensor *a_conv1_sum_mid, *a_conv1_sum, *a_conv1_sum_sq; // for layernorm
 Tensor *a_conv2, *a_relu2, *a_pool2;
 Tensor *a_conv3, *a_relu3;
 Tensor *a_conv4, *a_relu4;
 Tensor *a_conv5, *a_relu5;
 Tensor *a_conv6, *a_layernorm6, *a_relu6, *a_pool6;
-Tensor *a_conv6_sum, *a_conv6_sum_sq; // for layernorm
+Tensor *a_conv6_sum_mid, *a_conv6_sum, *a_conv6_sum_sq; // for layernorm
 Tensor *a_collapse;
 Tensor *a_linear1, *a_relu7;
 Tensor *a_linear2, *a_relu8;
@@ -123,103 +126,124 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output);
 
 // Cuda layers
-__global__ void cuda_conv1d(Tensor input, Tensor weight, Tensor bias, Tensor output);
-__global__ void cuda_relu(Tensor input, Tensor output);
-__global__ void cuda_maxpool1d(Tensor input, Tensor output); // always 3x3
-__global__ void cuda_collapse(Tensor input, Tensor output);
-__global__ void cuda_linear(Tensor input, Tensor weight, Tensor bias, Tensor output);
-__global__ void cuda_layernorm(Tensor input, Tensor gamma, Tensor beta, Tensor output,
+__global__ void cuda_conv1d(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output);
+__global__ void cuda_relu(int gpu, Tensor input, Tensor output);
+__global__ void cuda_maxpool1d(int gpu, Tensor input, Tensor output); // always 3x3
+__global__ void cuda_collapse(int gpu, Tensor input, Tensor output);
+__global__ void cuda_linear(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output);
+__global__ void cuda_layernorm(int gpu, Tensor input, Tensor gamma, Tensor beta, Tensor output,
                                Tensor sum, Tensor sum_sq);
 
 // Cuda operations
-__global__ void cuda_reduce_sum(Tensor input, Tensor output, int N);
-__global__ void cuda_reduce_sum_sq(Tensor input, Tensor output, int N);
-
-#define BATCH 512
+__global__ void cuda_reduce_sum(int gpu, Tensor input, Tensor output, int N);
+__global__ void cuda_reduce_sum_sq(int gpu, Tensor input, Tensor output, int N);
 
 // Parallelization method is totally up to you, but you should gather
 // the output at rank 0
 void classifier(float *input_, float *output_, int N) {
-  assert(N % BATCH == 0);
+  assert(N / mpi_world_size / NGPU == BATCH);
 
-  if (mpi_rank == 0) {
-    for (int n = 0; n < N; n += BATCH) {  // N input sentences
-      // Load BATCH sentences
-      Tensor *input = new Tensor({BATCH, VOCAB_SIZE, MAX_LENGTH}, input_ + n * VOCAB_SIZE * MAX_LENGTH);
+  Tensor *input = new Tensor({ N / mpi_world_size, VOCAB_SIZE, MAX_LENGTH });
+  Tensor *output = new Tensor({ N / mpi_world_size });
+  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_Scatter(
+    input_, input->num_elem(), MPI_FLOAT,
+    input->buf, input->num_elem(), MPI_FLOAT,
+    0, MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
 
-      // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
-      input->copy_to_gpu();
-      cuda_conv1d<<<dim3(1008, BATCH), 256>>>(*input, *w_conv1, *b_conv1, *a_conv1);
-      cuda_reduce_sum<<<dim3(1008, BATCH), 256, 256 * sizeof(float)>>>(*a_conv1, *a_conv1_sum, 256);
-      cuda_reduce_sum<<<dim3(BATCH, 1), 1024, 1024 * sizeof(float)>>>(*a_conv1_sum, *a_conv1_sum, 1008);
-      cuda_reduce_sum_sq<<<dim3(1008, BATCH), 256, 256 * sizeof(float)>>>(*a_conv1, *a_conv1_sum_sq, 256);
-      cuda_reduce_sum<<<dim3(BATCH, 1), 1024, 1024 * sizeof(float)>>>(*a_conv1_sum_sq, *a_conv1_sum_sq, 1008);
-      cuda_layernorm<<<dim3(1008, BATCH), 256>>>(*a_conv1, *gamma_conv1, *beta_conv1, *a_layernorm1,
-                                    *a_conv1_sum, *a_conv1_sum_sq);
-      cuda_relu<<<BATCH*1008, 256>>>(*a_layernorm1, *a_relu1);
-      cuda_maxpool1d<<<dim3(336, BATCH), 256>>>(*a_relu1, *a_pool1);
+  for (int gpu = 0; gpu < NGPU; gpu++) {
+    cudaSetDevice(gpu);
 
-      // Conv block 2 : Conv1d + ReLU + MaxPool1d
-      cuda_conv1d<<<dim3(330, BATCH), 256>>>(*a_pool1, *w_conv2, *b_conv2, *a_conv2);
-      cuda_relu<<<BATCH*330, 256>>>(*a_conv2, *a_relu2);
-      cuda_maxpool1d<<<dim3(110, BATCH), 256>>>(*a_relu2, *a_pool2);
+    // Select input slice
+    Tensor *input_slice = new Tensor({ BATCH, VOCAB_SIZE, MAX_LENGTH },
+                                     input->buf + gpu * BATCH * VOCAB_SIZE * MAX_LENGTH);
+    input_slice->copy_to_gpu(gpu);
+    // Ready!
 
-      // Conv block 3 : Conv1d + ReLU
-      cuda_conv1d<<<dim3(108, BATCH), 256>>>(*a_pool2, *w_conv3, *b_conv3, *a_conv3);
-      cuda_relu<<<BATCH*108, 256>>>(*a_conv3, *a_relu3);
+    // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
+    cuda_conv1d<<<dim3(1008, BATCH), 256, 0, streams[gpu]>>>(gpu, *input_slice, *w_conv1, *b_conv1, *a_conv1);
+    cuda_reduce_sum<<<dim3(1008, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1, *a_conv1_sum_mid, 256);
+    cuda_reduce_sum<<<dim3(BATCH, 1), 1024, 1024 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1_sum_mid, *a_conv1_sum, 1008);
+    cuda_reduce_sum_sq<<<dim3(1008, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1, *a_conv1_sum_mid, 256);
+    cuda_reduce_sum<<<dim3(BATCH, 1), 1024, 1024 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1_sum_mid, *a_conv1_sum_sq, 1008);
+    cuda_layernorm<<<dim3(1008, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_conv1, *gamma_conv1, *beta_conv1, *a_layernorm1,
+                                               *a_conv1_sum, *a_conv1_sum_sq);
+    cuda_relu<<<BATCH*1008, 256, 0, streams[gpu]>>>(gpu, *a_layernorm1, *a_relu1);
+    cuda_maxpool1d<<<dim3(336, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu1, *a_pool1);
 
-      // Conv block 4 : Conv1d + ReLU
-      cuda_conv1d<<<dim3(106, BATCH), 256>>>(*a_relu3, *w_conv4, *b_conv4, *a_conv4);
-      cuda_relu<<<BATCH*106, 256>>>(*a_conv4, *a_relu4);
+    // Conv block 2 : Conv1d + ReLU + MaxPool1d
+    cuda_conv1d<<<dim3(330, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_pool1, *w_conv2, *b_conv2, *a_conv2);
+    cuda_relu<<<BATCH*330, 256, 0, streams[gpu]>>>(gpu, *a_conv2, *a_relu2);
+    cuda_maxpool1d<<<dim3(110, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu2, *a_pool2);
 
-      // Conv block 5 : Conv1d + ReLU
-      cuda_conv1d<<<dim3(104, BATCH), 256>>>(*a_relu4, *w_conv5, *b_conv5, *a_conv5);
-      cuda_relu<<<BATCH*104, 256>>>(*a_conv5, *a_relu5);
+    // Conv block 3 : Conv1d + ReLU
+    cuda_conv1d<<<dim3(108, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_pool2, *w_conv3, *b_conv3, *a_conv3);
+    cuda_relu<<<BATCH*108, 256, 0, streams[gpu]>>>(gpu, *a_conv3, *a_relu3);
 
-      // Conv block 6 : Conv1d + LayerNorm + ReLU + MaxPool1d
-      cuda_conv1d<<<dim3(102, BATCH), 256>>>(*a_relu5, *w_conv6, *b_conv6, *a_conv6);
-      cuda_reduce_sum<<<dim3(102, BATCH), 256, 256 * sizeof(float)>>>(*a_conv6, *a_conv6_sum, 256);
-      cuda_reduce_sum<<<dim3(BATCH, 1), 128, 128 * sizeof(float)>>>(*a_conv6_sum, *a_conv6_sum, 102);
-      cuda_reduce_sum_sq<<<dim3(102, BATCH), 256, 256 * sizeof(float)>>>(*a_conv6, *a_conv6_sum_sq, 256);
-      cuda_reduce_sum<<<dim3(BATCH, 1), 128, 128 * sizeof(float)>>>(*a_conv6_sum_sq, *a_conv6_sum_sq, 102);
-      cuda_layernorm<<<dim3(102, BATCH), 256>>>(*a_conv6, *gamma_conv6, *beta_conv6, *a_layernorm6,
-                                    *a_conv6_sum, *a_conv6_sum_sq);
-      cuda_relu<<<BATCH*102, 256>>>(*a_layernorm6, *a_relu6);
-      cuda_maxpool1d<<<dim3(34, BATCH), 256>>>(*a_relu6, *a_pool6);
+    // Conv block 4 : Conv1d + ReLU
+    cuda_conv1d<<<dim3(106, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu3, *w_conv4, *b_conv4, *a_conv4);
+    cuda_relu<<<BATCH*106, 256, 0, streams[gpu]>>>(gpu, *a_conv4, *a_relu4);
 
-      // Collapse
-      cuda_collapse<<<BATCH*68, 128>>>(*a_pool6, *a_collapse);
+    // Conv block 5 : Conv1d + ReLU
+    cuda_conv1d<<<dim3(104, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu4, *w_conv5, *b_conv5, *a_conv5);
+    cuda_relu<<<BATCH*104, 256, 0, streams[gpu]>>>(gpu, *a_conv5, *a_relu5);
 
-      // FC block 1 : Linear + ReLU
-      cuda_linear<<<BATCH, 1024>>>(*a_collapse, *w_fc1, *b_fc1, *a_linear1);
-      cuda_relu<<<BATCH, 1024>>>(*a_linear1, *a_relu7);
+    // Conv block 6 : Conv1d + LayerNorm + ReLU + MaxPool1d
+    cuda_conv1d<<<dim3(102, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu5, *w_conv6, *b_conv6, *a_conv6);
+    cuda_reduce_sum<<<dim3(102, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6, *a_conv6_sum_mid, 256);
+    cuda_reduce_sum<<<dim3(BATCH, 1), 128, 128 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6_sum_mid, *a_conv6_sum, 102);
+    cuda_reduce_sum_sq<<<dim3(102, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6, *a_conv6_sum_mid, 256);
+    cuda_reduce_sum<<<dim3(BATCH, 1), 128, 128 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6_sum_mid, *a_conv6_sum_sq, 102);
+    cuda_layernorm<<<dim3(102, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_conv6, *gamma_conv6, *beta_conv6, *a_layernorm6,
+                                              *a_conv6_sum, *a_conv6_sum_sq);
+    cuda_relu<<<BATCH*102, 256, 0, streams[gpu]>>>(gpu, *a_layernorm6, *a_relu6);
+    cuda_maxpool1d<<<dim3(34, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu6, *a_pool6);
 
-      // FC block 2 : Linear + ReLU
-      cuda_linear<<<BATCH, 1024>>>(*a_relu7, *w_fc2, *b_fc2, *a_linear2);
-      cuda_relu<<<BATCH, 1024>>>(*a_linear2, *a_relu8);
+    // Collapse
+    cuda_collapse<<<BATCH*68, 128, 0, streams[gpu]>>>(gpu, *a_pool6, *a_collapse);
 
-      // FC block 3 : Linear
-      cuda_linear<<<BATCH, 4>>>(*a_relu8, *w_fc3, *b_fc3, *a_linear3);
+    // FC block 1 : Linear + ReLU
+    cuda_linear<<<BATCH, 1024, 0, streams[gpu]>>>(gpu, *a_collapse, *w_fc1, *b_fc1, *a_linear1);
+    cuda_relu<<<BATCH, 1024, 0, streams[gpu]>>>(gpu, *a_linear1, *a_relu7);
 
-      a_linear3->copy_to_cpu();
-      CHECK_CUDA(cudaStreamSynchronize(0));
+    // FC block 2 : Linear + ReLU
+    cuda_linear<<<BATCH, 1024, 0, streams[gpu]>>>(gpu, *a_relu7, *w_fc2, *b_fc2, *a_linear2);
+    cuda_relu<<<BATCH, 1024, 0, streams[gpu]>>>(gpu, *a_linear2, *a_relu8);
 
-      for (int i = 0; i < BATCH; i++) {
-        float max_val = -1e99f;
-        int max_idx = 0;
-        for (int j = 0; j < a_linear3->shape[1]; j++) {
-          if (a_linear3->buf[j + i * a_linear3->shape[1]] > max_val) {
-            max_val = a_linear3->buf[j + i * a_linear3->shape[1]];
-            max_idx = j;
-          }
+    // FC block 3 : Linear
+    cuda_linear<<<BATCH, 4, 0, streams[gpu]>>>(gpu, *a_relu8, *w_fc3, *b_fc3, *a_linear3);
+  }
+
+  // Wait for each GPU, copy to output
+  for (int gpu = 0; gpu < NGPU; gpu++) {
+    cudaSetDevice(gpu);
+
+    a_linear3->copy_to_cpu(gpu);
+    CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
+
+    for (int i = 0; i < BATCH; i++) {
+      float max_val = -1e99f;
+      int max_idx = 0;
+      for (int j = 0; j < a_linear3->shape[1]; j++) {
+        if (a_linear3->buf[j + i * a_linear3->shape[1]] > max_val) {
+          max_val = a_linear3->buf[j + i * a_linear3->shape[1]];
+          max_idx = j;
         }
-        output_[n + i] = max_idx;
       }
-    }  // end N input sentences loop
-  }    // if mpi_rank == 0
+      output->buf[i + gpu * BATCH] = max_idx;
+    }
+  }
+
+  // Gather
+  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_Gather(
+    output->buf, output->num_elem(), MPI_FLOAT,
+    output_, output->num_elem(), MPI_FLOAT,
+    0, MPI_COMM_WORLD);
 }
 
-__global__ void cuda_conv1d(Tensor input, Tensor weight, Tensor bias, Tensor output) {
+__global__ void cuda_conv1d(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output) {
   int j = blockIdx.y * blockDim.y + threadIdx.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -233,12 +257,12 @@ __global__ void cuda_conv1d(Tensor input, Tensor weight, Tensor bias, Tensor out
   int oc = i / OL;
   int ol = i % OL;
 
-  float val = bias.gbuf[oc];
+  float val = bias.gbuf[gpu][oc];
   for (int ic = 0; ic < IC; ++ic)
     for (int ks = 0; ks < KS; ++ks)
-      val += input.gbuf[ks + ol + ic * IL + j * IS] *
-        weight.gbuf[ks + ic * KS + oc * IC * KS];
-  output.gbuf[i + j * OS] = val;
+      val += input.gbuf[gpu][ks + ol + ic * IL + j * IS] *
+        weight.gbuf[gpu][ks + ic * KS + oc * IC * KS];
+  output.gbuf[gpu][i + j * OS] = val;
 }
 
 void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -268,12 +292,12 @@ void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 }
 
 
-__global__ void cuda_relu(Tensor input, Tensor output) {
+__global__ void cuda_relu(int gpu, Tensor input, Tensor output) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (input.gbuf[i] > 0.0f)
-    output.gbuf[i] = input.gbuf[i];
+  if (input.gbuf[gpu][i] > 0.0f)
+    output.gbuf[gpu][i] = input.gbuf[gpu][i];
   else
-    output.gbuf[i] = 0.0f;
+    output.gbuf[gpu][i] = 0.0f;
 }
 
 void relu(Tensor *input, Tensor *output) {
@@ -285,7 +309,7 @@ void relu(Tensor *input, Tensor *output) {
   }
 }
 
-__global__ void cuda_maxpool1d(Tensor input, Tensor output) {
+__global__ void cuda_maxpool1d(int gpu, Tensor input, Tensor output) {
   int j = blockIdx.y * blockDim.y + threadIdx.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -294,10 +318,10 @@ __global__ void cuda_maxpool1d(Tensor input, Tensor output) {
 
   float mx = -1e99f;
   for (int ks = 0; ks < 3; ++ks) {
-    float val = input.gbuf[ks + i * 3 + j * IS];
+    float val = input.gbuf[gpu][ks + i * 3 + j * IS];
     if (val > mx) mx = val;
   }
-  output.gbuf[i + j * OS] = mx;
+  output.gbuf[gpu][i + j * OS] = mx;
 }
 
 void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
@@ -317,9 +341,9 @@ void maxpool1d(Tensor *input, Tensor *output, int kernel_size, int stride) {
   }
 }
 
-__global__ void cuda_collapse(Tensor input, Tensor output) {
+__global__ void cuda_collapse(int gpu, Tensor input, Tensor output) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  output.gbuf[i] = input.gbuf[i];
+  output.gbuf[gpu][i] = input.gbuf[gpu][i];
 }
 
 void collapse(Tensor *input, Tensor *output) {
@@ -328,17 +352,17 @@ void collapse(Tensor *input, Tensor *output) {
   }
 }
 
-__global__ void cuda_linear(Tensor input, Tensor weight, Tensor bias, Tensor output) {
+__global__ void cuda_linear(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output) {
   int bid = blockIdx.x;
   int tid = threadIdx.x;
 
   int IC = input.shape[1];
   int OC = output.shape[1];
 
-  float val = bias.gbuf[tid];
+  float val = bias.gbuf[gpu][tid];
   for (int ic = 0; ic < IC; ++ic)
-    val += input.gbuf[ic + bid * IC] * weight.gbuf[ic + tid * IC];
-  output.gbuf[tid + bid * OC] = val;
+    val += input.gbuf[gpu][ic + bid * IC] * weight.gbuf[gpu][ic + tid * IC];
+  output.gbuf[gpu][tid + bid * OC] = val;
 }
 
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -356,7 +380,7 @@ void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   }
 }
 
-__global__ void cuda_reduce_sum(Tensor input, Tensor output, int N) {
+__global__ void cuda_reduce_sum(int gpu, Tensor input, Tensor output, int N) {
   extern __shared__ float sdata[];
 
   int IS = input.shape[1] * input.shape[2];
@@ -368,7 +392,7 @@ __global__ void cuda_reduce_sum(Tensor input, Tensor output, int N) {
   int i = bid * blockDim.x + tid;
 
   if (tid < N)
-    sdata[tid] = input.gbuf[i + j * IS];
+    sdata[tid] = input.gbuf[gpu][i + j * IS];
   else
     sdata[tid] = 0.0f;
   __syncthreads();
@@ -379,10 +403,10 @@ __global__ void cuda_reduce_sum(Tensor input, Tensor output, int N) {
     __syncthreads();
   }
   if (tid == 0)
-    output.gbuf[bid + j * OS] = sdata[0];
+    output.gbuf[gpu][bid + j * OS] = sdata[0];
 }
 
-__global__ void cuda_reduce_sum_sq(Tensor input, Tensor output, int N) {
+__global__ void cuda_reduce_sum_sq(int gpu, Tensor input, Tensor output, int N) {
   extern __shared__ float sdata[];
 
   int IS = input.shape[1] * input.shape[2];
@@ -394,7 +418,7 @@ __global__ void cuda_reduce_sum_sq(Tensor input, Tensor output, int N) {
   int i = bid * blockDim.x + tid;
 
   if (tid < N)
-    sdata[tid] = input.gbuf[i + j * IS];
+    sdata[tid] = input.gbuf[gpu][i + j * IS];
   else
     sdata[tid] = 0.0f;
   sdata[tid] *= sdata[tid];
@@ -406,10 +430,10 @@ __global__ void cuda_reduce_sum_sq(Tensor input, Tensor output, int N) {
     __syncthreads();
   }
   if (tid == 0)
-    output.gbuf[bid + j * OS] = sdata[0];
+    output.gbuf[gpu][bid + j * OS] = sdata[0];
 }
 
-__global__ void cuda_layernorm(Tensor input, Tensor gamma, Tensor beta, Tensor output,
+__global__ void cuda_layernorm(int gpu, Tensor input, Tensor gamma, Tensor beta, Tensor output,
                                Tensor sum, Tensor sum_sq) {
   int IS = input.shape[1] * input.shape[2];
 
@@ -418,13 +442,13 @@ __global__ void cuda_layernorm(Tensor input, Tensor gamma, Tensor beta, Tensor o
   int off = i + j * IS;
 
   // E[X], E[X^2]
-  float mean1 = sum.gbuf[j] / IS;
-  float mean2 = sum_sq.gbuf[j] / IS;
+  float mean1 = sum.gbuf[gpu][j] / IS;
+  float mean2 = sum_sq.gbuf[gpu][j] / IS;
   // V[X]
   float var = mean2 - mean1 * mean1;
 
-  output.gbuf[off] =
-    (input.gbuf[off] - mean1) / sqrtf(var + 1e-5) * gamma.gbuf[i] + beta.gbuf[i];
+  output.gbuf[gpu][off] =
+    (input.gbuf[gpu][off] - mean1) / sqrtf(var + 1e-5) * gamma.gbuf[gpu][i] + beta.gbuf[gpu][i];
 }
 
 void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
@@ -450,120 +474,162 @@ void layernorm(Tensor *input, Tensor *gamma, Tensor *beta, Tensor *output) {
 // Only the first process (root, mpi_rank == 0) has the parameter
 // You must broadcast it to the others
 void initialize_classifier(float *parameter, int N) {
-  CHECK_CUDA(cudaSetDevice(0));
+  vector<Tensor *> params, activations;
 
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi_world_size);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+
   if (mpi_rank == 0) {
+    // Read params from disk
     w_conv1 = new Tensor({256, 70, 7}, parameter + OFFSET0);
-    w_conv1->copy_to_gpu();
     b_conv1 = new Tensor({256}, parameter + OFFSET1);
-    b_conv1->copy_to_gpu();
     gamma_conv1 = new Tensor({256, 1008}, parameter + OFFSET2);
-    gamma_conv1->copy_to_gpu();
     beta_conv1 = new Tensor({256, 1008}, parameter + OFFSET3);
-    beta_conv1->copy_to_gpu();
 
     w_conv2 = new Tensor({256, 256, 7}, parameter + OFFSET4);
-    w_conv2->copy_to_gpu();
     b_conv2 = new Tensor({256}, parameter + OFFSET5);
-    b_conv2->copy_to_gpu();
     w_conv3 = new Tensor({256, 256, 3}, parameter + OFFSET6);
-    w_conv3->copy_to_gpu();
     b_conv3 = new Tensor({256}, parameter + OFFSET7);
-    b_conv3->copy_to_gpu();
     w_conv4 = new Tensor({256, 256, 3}, parameter + OFFSET8);
-    w_conv4->copy_to_gpu();
     b_conv4 = new Tensor({256}, parameter + OFFSET9);
-    b_conv4->copy_to_gpu();
     w_conv5 = new Tensor({256, 256, 3}, parameter + OFFSET10);
-    w_conv5->copy_to_gpu();
     b_conv5 = new Tensor({256}, parameter + OFFSET11);
-    b_conv5->copy_to_gpu();
 
     w_conv6 = new Tensor({256, 256, 3}, parameter + OFFSET12);
-    w_conv6->copy_to_gpu();
     b_conv6 = new Tensor({256}, parameter + OFFSET13);
-    b_conv6->copy_to_gpu();
     gamma_conv6 = new Tensor({256, 102}, parameter + OFFSET14);
-    gamma_conv6->copy_to_gpu();
     beta_conv6 = new Tensor({256, 102}, parameter + OFFSET15);
-    beta_conv6->copy_to_gpu();
+
     w_fc1 = new Tensor({1024, 8704}, parameter + OFFSET16);
-    w_fc1->copy_to_gpu();
     b_fc1 = new Tensor({1024}, parameter + OFFSET17);
-    b_fc1->copy_to_gpu();
     w_fc2 = new Tensor({1024, 1024}, parameter + OFFSET18);
-    w_fc2->copy_to_gpu();
     b_fc2 = new Tensor({1024}, parameter + OFFSET19);
-    b_fc2->copy_to_gpu();
     w_fc3 = new Tensor({4, 1024}, parameter + OFFSET20);
-    w_fc3->copy_to_gpu();
     b_fc3 = new Tensor({4}, parameter + OFFSET21);
-    b_fc3->copy_to_gpu();
+  } else {
+    // Allocate memory only, will be broadcasted later
+    w_conv1 = new Tensor({256, 70, 7});
+    b_conv1 = new Tensor({256});
+    gamma_conv1 = new Tensor({256, 1008});
+    beta_conv1 = new Tensor({256, 1008});
 
-    a_conv1 = new Tensor({BATCH, 256, 1008});
-    a_conv1->allocate_gpu();
-    a_conv1_sum = new Tensor({BATCH, 1024}); // rounded up
-    a_conv1_sum->allocate_gpu();
-    a_conv1_sum_sq = new Tensor({BATCH, 1024});
-    a_conv1_sum_sq->allocate_gpu();
-    a_layernorm1 = new Tensor({BATCH, 256, 1008});
-    a_layernorm1->allocate_gpu();
-    a_relu1 = new Tensor({BATCH, 256, 1008});
-    a_relu1->allocate_gpu();
-    a_pool1 = new Tensor({BATCH, 256, 336});
-    a_pool1->allocate_gpu();
+    w_conv2 = new Tensor({256, 256, 7});
+    b_conv2 = new Tensor({256});
+    w_conv3 = new Tensor({256, 256, 3});
+    b_conv3 = new Tensor({256});
+    w_conv4 = new Tensor({256, 256, 3});
+    b_conv4 = new Tensor({256});
+    w_conv5 = new Tensor({256, 256, 3});
+    b_conv5 = new Tensor({256});
 
-    a_conv2 = new Tensor({BATCH, 256, 330});
-    a_conv2->allocate_gpu();
-    a_relu2 = new Tensor({BATCH, 256, 330});
-    a_relu2->allocate_gpu();
-    a_pool2 = new Tensor({BATCH, 256, 110});
-    a_pool2->allocate_gpu();
+    w_conv6 = new Tensor({256, 256, 3});
+    b_conv6 = new Tensor({256});
+    gamma_conv6 = new Tensor({256, 102});
+    beta_conv6 = new Tensor({256, 102});
 
-    a_conv3 = new Tensor({BATCH, 256, 108});
-    a_conv3->allocate_gpu();
-    a_relu3 = new Tensor({BATCH, 256, 108});
-    a_relu3->allocate_gpu();
+    w_fc1 = new Tensor({1024, 8704});
+    b_fc1 = new Tensor({1024});
+    w_fc2 = new Tensor({1024, 1024});
+    b_fc2 = new Tensor({1024});
+    w_fc3 = new Tensor({4, 1024});
+    b_fc3 = new Tensor({4});
+  }
 
-    a_conv4 = new Tensor({BATCH, 256, 106});
-    a_conv4->allocate_gpu();
-    a_relu4 = new Tensor({BATCH, 256, 106});
-    a_relu4->allocate_gpu();
+  // Prepare to broadcast
+  params.push_back(w_conv1); params.push_back(b_conv1);
+  params.push_back(gamma_conv1); params.push_back(beta_conv1);
 
-    a_conv5 = new Tensor({BATCH, 256, 104});
-    a_conv5->allocate_gpu();
-    a_relu5 = new Tensor({BATCH, 256, 104});
-    a_relu5->allocate_gpu();
+  params.push_back(w_conv2); params.push_back(b_conv2);
+  params.push_back(w_conv3); params.push_back(b_conv3);
+  params.push_back(w_conv4); params.push_back(b_conv4);
+  params.push_back(w_conv5); params.push_back(b_conv5);
 
-    a_conv6 = new Tensor({BATCH, 256, 102});
-    a_conv6->allocate_gpu();
-    a_conv6_sum = new Tensor({BATCH, 128}); // rounded up
-    a_conv6_sum->allocate_gpu();
-    a_conv6_sum_sq = new Tensor({BATCH, 128});
-    a_conv6_sum_sq->allocate_gpu();
-    a_layernorm6 = new Tensor({BATCH, 256, 102});
-    a_layernorm6->allocate_gpu();
-    a_relu6 = new Tensor({BATCH, 256, 102});
-    a_relu6->allocate_gpu();
-    a_pool6 = new Tensor({BATCH, 256, 34});
-    a_pool6->allocate_gpu();
+  params.push_back(w_conv6); params.push_back(b_conv6);
+  params.push_back(gamma_conv6); params.push_back(beta_conv6);
 
-    a_collapse = new Tensor({BATCH, 8704});
-    a_collapse->allocate_gpu();
+  params.push_back(w_fc1); params.push_back(b_fc1);
+  params.push_back(w_fc2); params.push_back(b_fc2);
+  params.push_back(w_fc3); params.push_back(b_fc3);
 
-    a_linear1 = new Tensor({BATCH, 1024});
-    a_linear1->allocate_gpu();
-    a_relu7 = new Tensor({BATCH, 1024});
-    a_relu7->allocate_gpu();
+  // Activations are allocated everywhere
+  a_conv1 = new Tensor({BATCH, 256, 1008});
+  a_conv1_sum_mid = new Tensor({BATCH, 1024}); // rounded up
+  a_conv1_sum = new Tensor({BATCH, 1});
+  a_conv1_sum_sq = new Tensor({BATCH, 1});
+  a_layernorm1 = new Tensor({BATCH, 256, 1008});
+  a_relu1 = new Tensor({BATCH, 256, 1008});
+  a_pool1 = new Tensor({BATCH, 256, 336});
 
-    a_linear2 = new Tensor({BATCH, 1024});
-    a_linear2->allocate_gpu();
-    a_relu8 = new Tensor({BATCH, 1024});
-    a_relu8->allocate_gpu();
+  a_conv2 = new Tensor({BATCH, 256, 330});
+  a_relu2 = new Tensor({BATCH, 256, 330});
+  a_pool2 = new Tensor({BATCH, 256, 110});
 
-    a_linear3 = new Tensor({BATCH, 4});
-    a_linear3->allocate_gpu();
+  a_conv3 = new Tensor({BATCH, 256, 108});
+  a_relu3 = new Tensor({BATCH, 256, 108});
+
+  a_conv4 = new Tensor({BATCH, 256, 106});
+  a_relu4 = new Tensor({BATCH, 256, 106});
+
+  a_conv5 = new Tensor({BATCH, 256, 104});
+  a_relu5 = new Tensor({BATCH, 256, 104});
+
+  a_conv6 = new Tensor({BATCH, 256, 102});
+  a_conv6_sum_mid = new Tensor({BATCH, 128}); // rounded up
+  a_conv6_sum = new Tensor({BATCH, 1});
+  a_conv6_sum_sq = new Tensor({BATCH, 1});
+  a_layernorm6 = new Tensor({BATCH, 256, 102});
+  a_relu6 = new Tensor({BATCH, 256, 102});
+  a_pool6 = new Tensor({BATCH, 256, 34});
+  a_collapse = new Tensor({BATCH, 8704});
+
+  a_linear1 = new Tensor({BATCH, 1024});
+  a_relu7 = new Tensor({BATCH, 1024});
+  a_linear2 = new Tensor({BATCH, 1024});
+  a_relu8 = new Tensor({BATCH, 1024});
+  a_linear3 = new Tensor({BATCH, 4});
+
+  // Prepare activations
+  activations.push_back(a_conv1);
+  activations.push_back(a_conv1_sum_mid);
+  activations.push_back(a_conv1_sum);
+  activations.push_back(a_conv1_sum_sq);
+  activations.push_back(a_layernorm1);
+  activations.push_back(a_relu1);
+  activations.push_back(a_pool1);
+
+  activations.push_back(a_conv2); activations.push_back(a_relu2);
+  activations.push_back(a_pool2);
+  activations.push_back(a_conv3); activations.push_back(a_relu3);
+  activations.push_back(a_conv4); activations.push_back(a_relu4);
+  activations.push_back(a_conv5); activations.push_back(a_relu5);
+
+  activations.push_back(a_conv6);
+  activations.push_back(a_conv6_sum_mid);
+  activations.push_back(a_conv6_sum);
+  activations.push_back(a_conv6_sum_sq);
+  activations.push_back(a_layernorm6);
+  activations.push_back(a_relu6);
+  activations.push_back(a_pool6);
+  activations.push_back(a_collapse);
+
+  activations.push_back(a_linear1); activations.push_back(a_relu7);
+  activations.push_back(a_linear2); activations.push_back(a_relu8);
+  activations.push_back(a_linear3);
+
+  // Broacast, allocate, copy
+  for (auto t : params) {
+    MPI_Bcast(t->buf, t->num_elem(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+  }
+  for (int gpu = 0; gpu < NGPU; gpu++) {
+    cudaSetDevice(gpu);
+    cudaStreamCreate(&streams[gpu]);
+    for (auto t : params) {
+      t->copy_to_gpu(gpu);
+    }
+    for (auto t : activations) {
+      t->allocate_gpu(gpu);
+    }
+    CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
   }
 }
 
@@ -593,6 +659,9 @@ void finalize_classifier() {
     delete beta_conv1;
     delete beta_conv6;
     delete a_conv1;
+    delete a_conv1_sum_mid;
+    delete a_conv1_sum;
+    delete a_conv1_sum_sq;
     delete a_layernorm1;
     delete a_relu1;
     delete a_pool1;
@@ -606,6 +675,9 @@ void finalize_classifier() {
     delete a_conv5;
     delete a_relu5;
     delete a_conv6;
+    delete a_conv6_sum_mid;
+    delete a_conv6_sum;
+    delete a_conv6_sum_sq;
     delete a_layernorm6;
     delete a_relu6;
     delete a_pool6;

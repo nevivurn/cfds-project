@@ -1,6 +1,6 @@
 #!/bin/bash
 
-: ${NODES:=1}
+: ${NODES:=4}
 
 rm data
 ln -s /home/s2/data data
