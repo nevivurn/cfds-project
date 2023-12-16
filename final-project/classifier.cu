@@ -32,6 +32,7 @@ struct Tensor {
   void allocate_gpu(int gpu);
   void copy_to_gpu(int gpu);
   void copy_to_cpu(int gpu);
+	void freeall(void);
 
   float *buf = nullptr;
   float *gbuf[NGPU] = { nullptr };
@@ -56,9 +57,20 @@ Tensor::Tensor(std::vector<int> shape_, float *buf_) {
 }
 
 Tensor::~Tensor() {
-  // TODO(nevi): properly free memory
-  //if (buf != nullptr) free(buf);
-  //if (gbuf != nullptr) cudaFree(gbuf);
+	// Gets destroeyed by dereferenced copies, just do nothing
+}
+
+void Tensor::freeall(void) {
+	if (buf != nullptr) {
+		free(buf);
+		buf = nullptr;
+	}
+	for (int gpu = 0; gpu < NGPU; gpu++) {
+		if (gbuf[gpu] != nullptr) {
+			cudaFree(gbuf[gpu]);
+			gbuf[gpu] = nullptr;
+		}
+	}
 }
 
 int Tensor::num_elem() const {
@@ -152,12 +164,14 @@ void classifier(float *input_, float *output_, int N) {
     0, MPI_COMM_WORLD);
   MPI_Barrier(MPI_COMM_WORLD);
 
+	vector <Tensor *> input_slices;
   for (int gpu = 0; gpu < NGPU; gpu++) {
     cudaSetDevice(gpu);
 
     // Select input slice
     Tensor *input_slice = new Tensor({ BATCH, VOCAB_SIZE, MAX_LENGTH },
                                      input->buf + gpu * BATCH * VOCAB_SIZE * MAX_LENGTH);
+		input_slices.push_back(input_slice);
     input_slice->copy_to_gpu(gpu);
     // Ready!
 
@@ -241,6 +255,15 @@ void classifier(float *input_, float *output_, int N) {
     output->buf, output->num_elem(), MPI_FLOAT,
     output_, output->num_elem(), MPI_FLOAT,
     0, MPI_COMM_WORLD);
+
+	input->freeall();
+	delete input;
+	output->freeall();
+	delete output;
+	for (auto t : input_slices) {
+		t->freeall();
+		delete t;
+	}
 }
 
 __global__ void cuda_conv1d(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output) {
@@ -635,57 +658,106 @@ void initialize_classifier(float *parameter, int N) {
 
 // Free all dynamically allocated variables
 void finalize_classifier() {
-  if (mpi_rank == 0) {
-    delete w_conv1;
-    delete b_conv1;
-    delete w_conv2;
-    delete b_conv2;
-    delete w_conv3;
-    delete b_conv3;
-    delete w_conv4;
-    delete b_conv4;
-    delete w_conv5;
-    delete b_conv5;
-    delete w_conv6;
-    delete b_conv6;
-    delete w_fc1;
-    delete b_fc1;
-    delete w_fc2;
-    delete b_fc2;
-    delete w_fc3;
-    delete b_fc3;
-    delete gamma_conv1;
-    delete gamma_conv6;
-    delete beta_conv1;
-    delete beta_conv6;
-    delete a_conv1;
-    delete a_conv1_sum_mid;
-    delete a_conv1_sum;
-    delete a_conv1_sum_sq;
-    delete a_layernorm1;
-    delete a_relu1;
-    delete a_pool1;
-    delete a_conv2;
-    delete a_relu2;
-    delete a_pool2;
-    delete a_conv3;
-    delete a_relu3;
-    delete a_conv4;
-    delete a_relu4;
-    delete a_conv5;
-    delete a_relu5;
-    delete a_conv6;
-    delete a_conv6_sum_mid;
-    delete a_conv6_sum;
-    delete a_conv6_sum_sq;
-    delete a_layernorm6;
-    delete a_relu6;
-    delete a_pool6;
-    delete a_collapse;
-    delete a_linear1;
-    delete a_relu7;
-    delete a_linear2;
-    delete a_relu8;
-    delete a_linear3;
-  }
+	w_conv1->freeall();
+	delete w_conv1;
+	b_conv1->freeall();
+	delete b_conv1;
+	w_conv2->freeall();
+	delete w_conv2;
+	b_conv2->freeall();
+	delete b_conv2;
+	w_conv3->freeall();
+	delete w_conv3;
+	b_conv3->freeall();
+	delete b_conv3;
+	w_conv4->freeall();
+	delete w_conv4;
+	b_conv4->freeall();
+	delete b_conv4;
+	w_conv5->freeall();
+	delete w_conv5;
+	b_conv5->freeall();
+	delete b_conv5;
+	w_conv6->freeall();
+	delete w_conv6;
+	b_conv6->freeall();
+	delete b_conv6;
+	w_fc1->freeall();
+	delete w_fc1;
+	b_fc1->freeall();
+	delete b_fc1;
+	w_fc2->freeall();
+	delete w_fc2;
+	b_fc2->freeall();
+	delete b_fc2;
+	w_fc3->freeall();
+	delete w_fc3;
+	b_fc3->freeall();
+	delete b_fc3;
+	gamma_conv1->freeall();
+	delete gamma_conv1;
+	gamma_conv6->freeall();
+	delete gamma_conv6;
+	beta_conv1->freeall();
+	delete beta_conv1;
+	beta_conv6->freeall();
+	delete beta_conv6;
+	a_conv1->freeall();
+	delete a_conv1;
+	a_conv1_sum_mid->freeall();
+	delete a_conv1_sum_mid;
+	a_conv1_sum->freeall();
+	delete a_conv1_sum;
+	a_conv1_sum_sq->freeall();
+	delete a_conv1_sum_sq;
+	a_layernorm1->freeall();
+	delete a_layernorm1;
+	a_relu1->freeall();
+	delete a_relu1;
+	a_pool1->freeall();
+	delete a_pool1;
+	a_conv2->freeall();
+	delete a_conv2;
+	a_relu2->freeall();
+	delete a_relu2;
+	a_pool2->freeall();
+	delete a_pool2;
+	a_conv3->freeall();
+	delete a_conv3;
+	a_relu3->freeall();
+	delete a_relu3;
+	a_conv4->freeall();
+	delete a_conv4;
+	a_relu4->freeall();
+	delete a_relu4;
+	a_conv5->freeall();
+	delete a_conv5;
+	a_relu5->freeall();
+	delete a_relu5;
+	a_conv6->freeall();
+	delete a_conv6;
+	a_conv6_sum_mid->freeall();
+	delete a_conv6_sum_mid;
+	a_conv6_sum->freeall();
+	delete a_conv6_sum;
+	a_conv6_sum_sq->freeall();
+	delete a_conv6_sum_sq;
+	a_layernorm6->freeall();
+	delete a_layernorm6;
+	a_relu6->freeall();
+	delete a_relu6;
+	a_pool6->freeall();
+	delete a_pool6;
+	a_collapse->freeall();
+	delete a_collapse;
+	a_linear1->freeall();
+	delete a_linear1;
+	a_relu7->freeall();
+	delete a_relu7;
+	a_linear2->freeall();
+	delete a_linear2;
+	a_relu8->freeall();
+	delete a_relu8;
+	a_linear3->freeall();
+	delete a_linear3;
 }
