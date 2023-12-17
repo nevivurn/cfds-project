@@ -32,7 +32,7 @@ struct Tensor {
   void allocate_gpu(int gpu);
   void copy_to_gpu(int gpu);
   void copy_to_cpu(int gpu);
-	void freeall(void);
+  void freeall(void);
 
   float *buf = nullptr;
   float *gbuf[NGPU] = { nullptr };
@@ -57,20 +57,20 @@ Tensor::Tensor(std::vector<int> shape_, float *buf_) {
 }
 
 Tensor::~Tensor() {
-	// Gets destroeyed by dereferenced copies, just do nothing
+  // Gets destroeyed by dereferenced copies, just do nothing
 }
 
 void Tensor::freeall(void) {
-	if (buf != nullptr) {
-		free(buf);
-		buf = nullptr;
-	}
-	for (int gpu = 0; gpu < NGPU; gpu++) {
-		if (gbuf[gpu] != nullptr) {
-			cudaFree(gbuf[gpu]);
-			gbuf[gpu] = nullptr;
-		}
-	}
+  if (buf != nullptr) {
+    free(buf);
+    buf = nullptr;
+  }
+  for (int gpu = 0; gpu < NGPU; gpu++) {
+    if (gbuf[gpu] != nullptr) {
+      cudaFree(gbuf[gpu]);
+      gbuf[gpu] = nullptr;
+    }
+  }
 }
 
 int Tensor::num_elem() const {
@@ -99,13 +99,13 @@ void Tensor::copy_to_cpu(int gpu) {
 }
 
 void print_tensor(Tensor *t, int gpu, int n = 4) {
-  t->copy_to_cpu(gpu);
-  CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
+  //t->copy_to_cpu(gpu);
+  //CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
 
-  for (int i = 0; i < n; ++i) {
-    printf("%.4f ", t->buf[i]);
-  }
-  printf("\n");
+  //for (int i = 0; i < n; ++i) {
+  //  printf("%.4f ", t->buf[i]);
+  //}
+  //printf("\n");
 }
 
 // Parameters
@@ -157,26 +157,24 @@ void classifier(float *input_, float *output_, int N) {
 
   Tensor *input = new Tensor({ N / mpi_world_size, VOCAB_SIZE, MAX_LENGTH });
   Tensor *output = new Tensor({ N / mpi_world_size });
-  MPI_Barrier(MPI_COMM_WORLD);
   MPI_Scatter(
     input_, input->num_elem(), MPI_FLOAT,
     input->buf, input->num_elem(), MPI_FLOAT,
     0, MPI_COMM_WORLD);
-  MPI_Barrier(MPI_COMM_WORLD);
 
-	vector <Tensor *> input_slices;
+  vector <Tensor *> input_slices;
   for (int gpu = 0; gpu < NGPU; gpu++) {
     cudaSetDevice(gpu);
 
     // Select input slice
     Tensor *input_slice = new Tensor({ BATCH, VOCAB_SIZE, MAX_LENGTH },
                                      input->buf + gpu * BATCH * VOCAB_SIZE * MAX_LENGTH);
-		input_slices.push_back(input_slice);
+    input_slices.push_back(input_slice);
     input_slice->copy_to_gpu(gpu);
     // Ready!
 
     // Conv block 1 : Conv1d + LayerNorm + ReLU + MaxPool1d
-    cuda_conv1d<<<dim3(1008, BATCH), 256, 0, streams[gpu]>>>(gpu, *input_slice, *w_conv1, *b_conv1, *a_conv1);
+    cuda_conv1d<<<dim3((1008+32-7)/(32-7+1), 256, BATCH), dim3(32, 8), (70*7 + 70*32 + 8*32)*sizeof(float), streams[gpu]>>>(gpu, *input_slice, *w_conv1, *b_conv1, *a_conv1);
     cuda_reduce_sum<<<dim3(1008, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1, *a_conv1_sum_mid, 256);
     cuda_reduce_sum<<<dim3(BATCH, 1), 1024, 1024 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1_sum_mid, *a_conv1_sum, 1008);
     cuda_reduce_sum_sq<<<dim3(1008, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv1, *a_conv1_sum_mid, 256);
@@ -187,24 +185,24 @@ void classifier(float *input_, float *output_, int N) {
     cuda_maxpool1d<<<dim3(336, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu1, *a_pool1);
 
     // Conv block 2 : Conv1d + ReLU + MaxPool1d
-    cuda_conv1d<<<dim3(330, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_pool1, *w_conv2, *b_conv2, *a_conv2);
+    cuda_conv1d<<<dim3((330+16-7)/(16-7+1), 256, BATCH), dim3(16, 16), (256*7 + 256*16 + 16*16)*sizeof(float), streams[gpu]>>>(gpu, *a_pool1, *w_conv2, *b_conv2, *a_conv2);
     cuda_relu<<<BATCH*330, 256, 0, streams[gpu]>>>(gpu, *a_conv2, *a_relu2);
     cuda_maxpool1d<<<dim3(110, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu2, *a_pool2);
 
     // Conv block 3 : Conv1d + ReLU
-    cuda_conv1d<<<dim3(108, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_pool2, *w_conv3, *b_conv3, *a_conv3);
+    cuda_conv1d<<<dim3((108+32-3)/(32-3+1), 256, BATCH), dim3(32, 16), (256*3 + 256*36 + 16*32)*sizeof(float), streams[gpu]>>>(gpu, *a_pool2, *w_conv3, *b_conv3, *a_conv3);
     cuda_relu<<<BATCH*108, 256, 0, streams[gpu]>>>(gpu, *a_conv3, *a_relu3);
 
     // Conv block 4 : Conv1d + ReLU
-    cuda_conv1d<<<dim3(106, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu3, *w_conv4, *b_conv4, *a_conv4);
+    cuda_conv1d<<<dim3((106+32-3)/(32-3+1), 256, BATCH), dim3(32, 16), (256*3 + 256*32 + 16*32)*sizeof(float), streams[gpu]>>>(gpu, *a_relu3, *w_conv4, *b_conv4, *a_conv4);
     cuda_relu<<<BATCH*106, 256, 0, streams[gpu]>>>(gpu, *a_conv4, *a_relu4);
 
     // Conv block 5 : Conv1d + ReLU
-    cuda_conv1d<<<dim3(104, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu4, *w_conv5, *b_conv5, *a_conv5);
+    cuda_conv1d<<<dim3((104+32-3)/(32-3+1), 256, BATCH), dim3(32, 16), (256*3 + 256*32 + 16*32)*sizeof(float), streams[gpu]>>>(gpu, *a_relu4, *w_conv5, *b_conv5, *a_conv5);
     cuda_relu<<<BATCH*104, 256, 0, streams[gpu]>>>(gpu, *a_conv5, *a_relu5);
 
     // Conv block 6 : Conv1d + LayerNorm + ReLU + MaxPool1d
-    cuda_conv1d<<<dim3(102, BATCH), 256, 0, streams[gpu]>>>(gpu, *a_relu5, *w_conv6, *b_conv6, *a_conv6);
+    cuda_conv1d<<<dim3((102+32-3)/(32-3+1), 256, BATCH), dim3(32, 16), (256*3 + 256*32 + 16*32)*sizeof(float), streams[gpu]>>>(gpu, *a_relu5, *w_conv6, *b_conv6, *a_conv6);
     cuda_reduce_sum<<<dim3(102, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6, *a_conv6_sum_mid, 256);
     cuda_reduce_sum<<<dim3(BATCH, 1), 128, 128 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6_sum_mid, *a_conv6_sum, 102);
     cuda_reduce_sum_sq<<<dim3(102, BATCH), 256, 256 * sizeof(float), streams[gpu]>>>(gpu, *a_conv6, *a_conv6_sum_mid, 256);
@@ -250,42 +248,80 @@ void classifier(float *input_, float *output_, int N) {
   }
 
   // Gather
-  MPI_Barrier(MPI_COMM_WORLD);
   MPI_Gather(
     output->buf, output->num_elem(), MPI_FLOAT,
     output_, output->num_elem(), MPI_FLOAT,
     0, MPI_COMM_WORLD);
 
-	input->freeall();
-	delete input;
-	output->freeall();
-	delete output;
-	for (auto t : input_slices) {
-		t->freeall();
-		delete t;
-	}
+  input->freeall();
+  delete input;
+  output->freeall();
+  delete output;
+  for (auto t : input_slices) {
+    t->freeall();
+    delete t;
+  }
 }
 
 __global__ void cuda_conv1d(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output) {
-  int j = blockIdx.y * blockDim.y + threadIdx.y;
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  extern __shared__ float sdata[];
 
   int IC = input.shape[1];
+  int ICN = (IC + blockDim.y - 1) / blockDim.y; // number of input channels per thread
   int IL = input.shape[2];
   int IS = IC * IL;
   int OL = output.shape[2];
   int OS = output.shape[1] * output.shape[2];
   int KS = weight.shape[2];
+  int OLN = blockDim.x - KS + 1; // number of outputs per block
+  int TL = blockDim.x;
 
-  int oc = i / OL;
-  int ol = i % OL;
+  // IC * KS
+  float *wtile = (float *) &sdata[0];
+  // IC * blockDim.x
+  float *itile = (float *) &wtile[IC * KS];
+  // 4 * blockDim.x
+  float *otile = (float *) &itile[IC * OLN];
 
-  float val = bias.gbuf[gpu][oc];
-  for (int ic = 0; ic < IC; ++ic)
-    for (int ks = 0; ks < KS; ++ks)
-      val += input.gbuf[gpu][ks + ol + ic * IL + j * IS] *
-        weight.gbuf[gpu][ks + ic * KS + oc * IC * KS];
-  output.gbuf[gpu][i + j * OS] = val;
+  int ol = blockIdx.x * OLN + threadIdx.x;
+  int oc = blockIdx.y;
+  int ix = blockIdx.z;
+  // Load inputs
+  for (int j = threadIdx.y * ICN; j < (threadIdx.y + 1) * ICN && j < IC; j++) {
+    if (ol < IL)
+      itile[threadIdx.x + j * TL] = input.gbuf[gpu][ol + j * IL + ix * IS];
+    else
+      itile[threadIdx.x + j * TL] = 0.0f;
+  }
+
+  if (threadIdx.x < KS) {
+    // Load weights
+    for (int j = threadIdx.y * ICN; j < (threadIdx.y + 1) * ICN && j < IC; j++)
+      wtile[threadIdx.x + j * KS] =
+        weight.gbuf[gpu][threadIdx.x + j * KS + oc * IC * KS];
+  }
+  __syncthreads();
+
+  if (ol < OL) {
+    // Compute intermediates
+    float val = 0.0f;
+    for (int j = threadIdx.y * ICN; j < (threadIdx.y + 1) * ICN && j < IC; j++) {
+      for (int i = 0; i < KS; i++)
+        val +=
+          itile[threadIdx.x + i + j * TL] *
+          wtile[i + j * KS];
+    }
+    otile[threadIdx.x + threadIdx.y * OLN] = val;
+  }
+  __syncthreads();
+
+  // Write output
+  if (threadIdx.y == 0 && ol < OL) {
+    float val = bias.gbuf[gpu][oc];
+    for (int i = 0; i < blockDim.y; i++)
+      val += otile[threadIdx.x + i * OLN];
+    output.gbuf[gpu][ol + oc * OL + ix * OS] = val;
+  }
 }
 
 void conv1d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
@@ -658,106 +694,106 @@ void initialize_classifier(float *parameter, int N) {
 
 // Free all dynamically allocated variables
 void finalize_classifier() {
-	w_conv1->freeall();
-	delete w_conv1;
-	b_conv1->freeall();
-	delete b_conv1;
-	w_conv2->freeall();
-	delete w_conv2;
-	b_conv2->freeall();
-	delete b_conv2;
-	w_conv3->freeall();
-	delete w_conv3;
-	b_conv3->freeall();
-	delete b_conv3;
-	w_conv4->freeall();
-	delete w_conv4;
-	b_conv4->freeall();
-	delete b_conv4;
-	w_conv5->freeall();
-	delete w_conv5;
-	b_conv5->freeall();
-	delete b_conv5;
-	w_conv6->freeall();
-	delete w_conv6;
-	b_conv6->freeall();
-	delete b_conv6;
-	w_fc1->freeall();
-	delete w_fc1;
-	b_fc1->freeall();
-	delete b_fc1;
-	w_fc2->freeall();
-	delete w_fc2;
-	b_fc2->freeall();
-	delete b_fc2;
-	w_fc3->freeall();
-	delete w_fc3;
-	b_fc3->freeall();
-	delete b_fc3;
-	gamma_conv1->freeall();
-	delete gamma_conv1;
-	gamma_conv6->freeall();
-	delete gamma_conv6;
-	beta_conv1->freeall();
-	delete beta_conv1;
-	beta_conv6->freeall();
-	delete beta_conv6;
-	a_conv1->freeall();
-	delete a_conv1;
-	a_conv1_sum_mid->freeall();
-	delete a_conv1_sum_mid;
-	a_conv1_sum->freeall();
-	delete a_conv1_sum;
-	a_conv1_sum_sq->freeall();
-	delete a_conv1_sum_sq;
-	a_layernorm1->freeall();
-	delete a_layernorm1;
-	a_relu1->freeall();
-	delete a_relu1;
-	a_pool1->freeall();
-	delete a_pool1;
-	a_conv2->freeall();
-	delete a_conv2;
-	a_relu2->freeall();
-	delete a_relu2;
-	a_pool2->freeall();
-	delete a_pool2;
-	a_conv3->freeall();
-	delete a_conv3;
-	a_relu3->freeall();
-	delete a_relu3;
-	a_conv4->freeall();
-	delete a_conv4;
-	a_relu4->freeall();
-	delete a_relu4;
-	a_conv5->freeall();
-	delete a_conv5;
-	a_relu5->freeall();
-	delete a_relu5;
-	a_conv6->freeall();
-	delete a_conv6;
-	a_conv6_sum_mid->freeall();
-	delete a_conv6_sum_mid;
-	a_conv6_sum->freeall();
-	delete a_conv6_sum;
-	a_conv6_sum_sq->freeall();
-	delete a_conv6_sum_sq;
-	a_layernorm6->freeall();
-	delete a_layernorm6;
-	a_relu6->freeall();
-	delete a_relu6;
-	a_pool6->freeall();
-	delete a_pool6;
-	a_collapse->freeall();
-	delete a_collapse;
-	a_linear1->freeall();
-	delete a_linear1;
-	a_relu7->freeall();
-	delete a_relu7;
-	a_linear2->freeall();
-	delete a_linear2;
-	a_relu8->freeall();
-	delete a_relu8;
-	a_linear3->freeall();
-	delete a_linear3;
+  w_conv1->freeall();
+  delete w_conv1;
+  b_conv1->freeall();
+  delete b_conv1;
+  w_conv2->freeall();
+  delete w_conv2;
+  b_conv2->freeall();
+  delete b_conv2;
+  w_conv3->freeall();
+  delete w_conv3;
+  b_conv3->freeall();
+  delete b_conv3;
+  w_conv4->freeall();
+  delete w_conv4;
+  b_conv4->freeall();
+  delete b_conv4;
+  w_conv5->freeall();
+  delete w_conv5;
+  b_conv5->freeall();
+  delete b_conv5;
+  w_conv6->freeall();
+  delete w_conv6;
+  b_conv6->freeall();
+  delete b_conv6;
+  w_fc1->freeall();
+  delete w_fc1;
+  b_fc1->freeall();
+  delete b_fc1;
+  w_fc2->freeall();
+  delete w_fc2;
+  b_fc2->freeall();
+  delete b_fc2;
+  w_fc3->freeall();
+  delete w_fc3;
+  b_fc3->freeall();
+  delete b_fc3;
+  gamma_conv1->freeall();
+  delete gamma_conv1;
+  gamma_conv6->freeall();
+  delete gamma_conv6;
+  beta_conv1->freeall();
+  delete beta_conv1;
+  beta_conv6->freeall();
+  delete beta_conv6;
+  a_conv1->freeall();
+  delete a_conv1;
+  a_conv1_sum_mid->freeall();
+  delete a_conv1_sum_mid;
+  a_conv1_sum->freeall();
+  delete a_conv1_sum;
+  a_conv1_sum_sq->freeall();
+  delete a_conv1_sum_sq;
+  a_layernorm1->freeall();
+  delete a_layernorm1;
+  a_relu1->freeall();
+  delete a_relu1;
+  a_pool1->freeall();
+  delete a_pool1;
+  a_conv2->freeall();
+  delete a_conv2;
+  a_relu2->freeall();
+  delete a_relu2;
+  a_pool2->freeall();
+  delete a_pool2;
+  a_conv3->freeall();
+  delete a_conv3;
+  a_relu3->freeall();
+  delete a_relu3;
+  a_conv4->freeall();
+  delete a_conv4;
+  a_relu4->freeall();
+  delete a_relu4;
+  a_conv5->freeall();
+  delete a_conv5;
+  a_relu5->freeall();
+  delete a_relu5;
+  a_conv6->freeall();
+  delete a_conv6;
+  a_conv6_sum_mid->freeall();
+  delete a_conv6_sum_mid;
+  a_conv6_sum->freeall();
+  delete a_conv6_sum;
+  a_conv6_sum_sq->freeall();
+  delete a_conv6_sum_sq;
+  a_layernorm6->freeall();
+  delete a_layernorm6;
+  a_relu6->freeall();
+  delete a_relu6;
+  a_pool6->freeall();
+  delete a_pool6;
+  a_collapse->freeall();
+  delete a_collapse;
+  a_linear1->freeall();
+  delete a_linear1;
+  a_relu7->freeall();
+  delete a_relu7;
+  a_linear2->freeall();
+  delete a_linear2;
+  a_relu8->freeall();
+  delete a_relu8;
+  a_linear3->freeall();
+  delete a_linear3;
 }
