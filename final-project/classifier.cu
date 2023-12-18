@@ -25,6 +25,7 @@ static cudaStream_t streams[NGPU];
 struct Tensor {
   Tensor(std::vector<int> shape_);
   Tensor(std::vector<int> shape_, float *buf_);
+  Tensor(std::vector<int> shape_, bool reuse, float *buf_);
   ~Tensor();
   __host__ __device__ int num_elem() const;
   void fill_zeros();
@@ -38,19 +39,24 @@ struct Tensor {
   float *gbuf[NGPU] = { nullptr };
   int ndim = 0;
   int shape[4];
-  int datashape[4];
 };
+
+Tensor::Tensor(std::vector<int> shape_, bool reuse, float *buf_) {
+  ndim = shape_.size();
+  for (int i = 0; i < ndim; ++i) { shape[i] = shape_[i]; }
+  buf = buf_;
+}
 
 Tensor::Tensor(std::vector<int> shape_) {
   ndim = shape_.size();
-  for (int i = 0; i < ndim; ++i) { shape[i] = datashape[i] = shape_[i]; }
+  for (int i = 0; i < ndim; ++i) { shape[i] = shape_[i]; }
   int N_ = num_elem();
   buf = (float *) calloc(N_, sizeof(float));
 }
 
 Tensor::Tensor(std::vector<int> shape_, float *buf_) {
   ndim = shape_.size();
-  for (int i = 0; i < ndim; ++i) { shape[i] = datashape[i] = shape_[i]; }
+  for (int i = 0; i < ndim; ++i) { shape[i] = shape_[i]; }
   int N_ = num_elem();
   buf = (float *) calloc(N_, sizeof(float));
   for (int n = 0; n < N_; ++n) { buf[n] = buf_[n]; }
@@ -157,21 +163,18 @@ void classifier(float *input_, float *output_, int N) {
 
   Tensor *input = new Tensor({ N / mpi_world_size, VOCAB_SIZE, MAX_LENGTH });
   Tensor *output = new Tensor({ N / mpi_world_size });
-  MPI_Barrier(MPI_COMM_WORLD);
   MPI_Scatter(
     input_, input->num_elem(), MPI_FLOAT,
     input->buf, input->num_elem(), MPI_FLOAT,
     0, MPI_COMM_WORLD);
-  MPI_Barrier(MPI_COMM_WORLD);
 
-	vector <Tensor *> input_slices;
   for (int gpu = 0; gpu < NGPU; gpu++) {
-    cudaSetDevice(gpu);
-
     // Select input slice
     Tensor *input_slice = new Tensor({ BATCH, VOCAB_SIZE, MAX_LENGTH },
+                                     true,
                                      input->buf + gpu * BATCH * VOCAB_SIZE * MAX_LENGTH);
-		input_slices.push_back(input_slice);
+
+    cudaSetDevice(gpu);
     input_slice->copy_to_gpu(gpu);
     // Ready!
 
@@ -250,20 +253,19 @@ void classifier(float *input_, float *output_, int N) {
   }
 
   // Gather
-  MPI_Barrier(MPI_COMM_WORLD);
   MPI_Gather(
     output->buf, output->num_elem(), MPI_FLOAT,
     output_, output->num_elem(), MPI_FLOAT,
     0, MPI_COMM_WORLD);
 
-	input->freeall();
-	delete input;
-	output->freeall();
-	delete output;
-	for (auto t : input_slices) {
-		t->freeall();
-		delete t;
-	}
+	//input->freeall();
+	//delete input;
+	//output->freeall();
+	//delete output;
+	//for (auto t : input_slices) {
+	//	t->freeall();
+	//	delete t;
+	//}
 }
 
 __global__ void cuda_conv1d(int gpu, Tensor input, Tensor weight, Tensor bias, Tensor output) {
